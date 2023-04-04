@@ -23,15 +23,19 @@ description: |
 
   TODO: include link to snap
 
-subordinate: True
+assumes:
+  - k8s-api
+
+containers:
+  pje:
+    resource: pje-image
 
 resources:
-  exporter-snap:
-    type: file
-    description: |
-      (Optional) Snap that implements actual data collection and export. If not provided, charm
-      will try to download prometheus-juju-exporter from snap store.
-    filename: prometheus-juju-exporter.snap
+  pje-image:
+    type: oci-image
+    description: OCI image for prometheus-juju-exporter
+    # Included for simplicity in integration tests
+    upstream-source: ghcr.io/agileshaw/prometheus-juju-exporter:0.2
 
 provides:
   prometheus-scrape:  # Relation with legacy "prometheus2" charm
@@ -41,7 +45,3 @@ provides:
   grafana-k8s-dashboard:
     interface: grafana_dashboard
 
-requires:
-  general-info:
-    interface: juju-info
-    scope: container

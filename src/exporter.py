@@ -8,12 +8,11 @@ Module focused on handling operations related to prometheus-juju-exporter snap.
 """
 import logging
 import os
+from io import StringIO
 import subprocess
 from typing import Any, Dict, List, NamedTuple, Optional, Union
 
 import yaml
-from charmhelpers.core import host as ch_host
-from charmhelpers.fetch import snap
 from packaging import version
 
 # Log messages can be retrieved using juju debug-log
@@ -22,10 +21,6 @@ logger = logging.getLogger(__name__)
 
 class ExporterConfigError(Exception):
     """Indicates problem with configuration of exporter service."""
-
-
-class ExporterSnapError(Exception):
-    """Indicates problem with exporter snap."""
 
 
 class ExporterConfig(NamedTuple):
@@ -54,15 +49,6 @@ class ExporterConfig(NamedTuple):
             return ""
 
         endpoints: Union[str, List[str]] = self.controller.split(",")
-        current_version = ExporterSnap.version()
-
-        if current_version <= version.parse("1.0.1"):
-            if len(endpoints) > 1:
-                raise ExporterConfigError(
-                    f"Currently installed version of exporter ({current_version}) does "
-                    f"not support HA controller configuration."
-                )
-            endpoints = endpoints[0]
 
         return endpoints
 
@@ -91,16 +77,12 @@ class ExporterConfig(NamedTuple):
         }
 
 
-class ExporterSnap:
+class ExporterOCI:
     """Class that handles operations of prometheus-juju-exporter snap and related services."""
 
-    SNAP_NAME = "prometheus-juju-exporter"
-    SNAP_CONFIG_PATH = f"/var/snap/{SNAP_NAME}/current/config.yaml"
-    _SNAP_ACTIONS = [
-        "stop",
-        "start",
-        "restart",
-    ]
+    OCI_NAME = "prometheus-juju-exporter"
+    OCI_CONFIG_DIR = f"/var/lib/{OCI_NAME}"
+    OCI_CONFIG_PATH = f"{OCI_CONFIG_DIR}/config.yaml"
     _REQUIRED_CONFIG = [
         "customer.name",
         "customer.cloud_name",
@@ -113,32 +95,6 @@ class ExporterSnap:
         "detection.virt_macs",
         "detection.match_interfaces",
     ]
-
-    @property
-    def service_name(self) -> str:
-        """Return name of the exporter's systemd service."""
-        return f"snap.{self.SNAP_NAME}.{self.SNAP_NAME}.service"
-
-    def install(self, snap_path: Optional[str] = None) -> None:
-        """Install prometheus-juju-exporter snap.
-
-        This method tries to install snap from local file if parameter :snap_path is provided.
-        Otherwise, it'll attempt installation from snap store based on ExporterSnap.SNAP_NAME.
-
-        :param snap_path: Optional parameter to provide local file as source of snap installation.
-        :raises:
-            snap.CouldNotAcquireLockException: In case of snap installation failure.
-        """
-        if snap_path:
-            logger.info("Installing snap %s from local resource.", self.SNAP_NAME)
-            snap.snap_install(snap_path, "--dangerous")
-        else:
-            logger.info("Installing %s snap from snap store.", self.SNAP_NAME)
-            snap.snap_install(self.SNAP_NAME)
-
-    def uninstall(self) -> None:
-        """Remove prometheus-juju-exporter snap."""
-        snap.snap_remove(self.SNAP_NAME)
 
     def _validate_required_options(self, config: Dict[str, Any]) -> List[str]:
         """Validate that config has all required options for snap to run."""
@@ -204,61 +160,23 @@ class ExporterSnap:
 
     def apply_config(self, exporter_config: Dict[str, Any]) -> None:
         """Update configuration file for exporter service."""
-        self.stop()
         logger.info("Updating exporter service configuration.")
         self.validate_config(exporter_config)
 
-        with open(self.SNAP_CONFIG_PATH, "w", encoding="utf-8") as config_file:
-            yaml.safe_dump(exporter_config, config_file)
+        # if not os.path.exists(self.OCI_CONFIG_DIR):
+        #     os.mkdir(self.OCI_CONFIG_DIR)
+        # else:
+        #     if not os.path.isdir(self.OCI_CONFIG_DIR):
+        #         os.remove(self.OCI_CONFIG_DIR)
+        #         os.mkdir(self.OCI_CONFIG_DIR)
 
-        self.restart()
+        # with open(self.OCI_CONFIG_PATH, "w", encoding="utf-8") as config_file:
+        data_file = StringIO()
+        yaml.safe_dump(exporter_config, data_file)
+        data_file.seek(0)
+        ret = data_file.read()
+        data_file.close()
         logger.info("Exporter configuration updated.")
+        return ret
 
-    @classmethod
-    def version(cls) -> version.Version:
-        """Return version of currently installed exporter."""
-        cmd = ["snap", "info", cls.SNAP_NAME]
-        try:
-            raw_output = subprocess.check_output(cmd)
-            snap_info = yaml.safe_load(raw_output)
-        except (subprocess.CalledProcessError, yaml.YAMLError) as exc:
-            raise ExporterSnapError(f"Failed to get exporter snap version: {exc}") from exc
-
-        if "installed" not in snap_info:
-            raise ExporterSnapError("Exporter snap is not installed.")
-
-        snap_version = snap_info["installed"].split()[0]
-        return version.parse(snap_version)
-
-    def restart(self) -> None:
-        """Restart exporter service."""
-        self._execute_service_action("restart")
-
-    def stop(self) -> None:
-        """Stop exporter service."""
-        self._execute_service_action("stop")
-
-    def start(self) -> None:
-        """Start exporter service."""
-        self._execute_service_action("start")
-
-    def is_running(self) -> bool:
-        """Check if exporter service is running."""
-        return ch_host.service_running(self.service_name)
-
-    def _execute_service_action(self, action: str) -> None:
-        """Execute one of the supported snap service actions.
-
-        Supported actions:
-            - stop
-            - start
-            - restart
-
-        :param action: snap service action to execute
-        :raises:
-            RuntimeError: If requested action is not supported.
-        """
-        if action not in self._SNAP_ACTIONS:
-            raise RuntimeError(f"Snap service action '{action}' is not supported.")
-        logger.info("%s service executing action: %s", self.SNAP_NAME, action)
-        subprocess.call(["snap", action, self.SNAP_NAME])
+       
