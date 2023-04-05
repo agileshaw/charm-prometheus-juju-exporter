@@ -12,6 +12,7 @@ develop a new k8s charm using the Operator Framework:
     https://discourse.charmhub.io/t/4208
 """
 
+import hashlib
 import logging
 import os
 import pathlib
@@ -34,50 +35,25 @@ from ops.charm import (
     UpgradeCharmEvent,
 )
 from ops.main import main
-from ops.model import ActiveStatus, BlockedStatus, MaintenanceStatus, ModelError
+from ops.model import ActiveStatus, BlockedStatus, WaitingStatus, MaintenanceStatus, ModelError
+from ops.pebble import Layer
 from prometheus_interface.operator import (
     PrometheusConfigError,
     PrometheusConnected,
     PrometheusScrapeTarget,
 )
 
-from exporter import ExporterConfig, ExporterConfigError, ExporterSnap
+from exporter import ExporterConfig, ExporterConfigError, ExporterOCI
 
 # Log messages can be retrieved using juju debug-log
 logger = logging.getLogger(__name__)
-
-
-def evaluate_status(func: Callable) -> Callable:
-    """Decorate `PrometheusJujuExporterCharm` method to perform status evaluation.
-
-    This wrapper can be used to decorate a method (primarily an event handler) from
-    `PrometheusJujuExporterCharm` class. When decorated function is executed, this
-    wrapper will perform final assessment of unit's state and sets unit status.
-    """
-
-    @wraps(func)
-    def wrapper(self: "PrometheusJujuExporterCharm", *args: Any, **kwargs: Any) -> Any:
-        """Execute wrapped method and perform status assessment."""
-        result = func(self, *args, **kwargs)
-
-        exporter_running = self.exporter.is_running()
-        if isinstance(self.unit.status, ActiveStatus) and not exporter_running:
-            self.unit.status = BlockedStatus(
-                "Exporter service is inactive. (See service logs in unit.)"
-            )
-        elif not isinstance(self.unit.status, ActiveStatus) and exporter_running:
-            self.unit.status = ActiveStatus("Unit is ready")
-
-        return result
-
-    return wrapper
 
 
 class PrometheusJujuExporterCharm(CharmBase):
     """Charm the service."""
 
     # Mapping between charm and snap configuration options
-    SNAP_CONFIG_MAP = {
+    OCI_CONFIG_MAP = {
         "debug": "debug",
         "customer": "customer.name",
         "cloud-name": "customer.cloud_name",
@@ -89,20 +65,22 @@ class PrometheusJujuExporterCharm(CharmBase):
         "virtual-macs": "detection.virt_macs",
         "match-interfaces": "detection.match_interfaces",
     }
+    OCI_NAME = "prometheus-juju-exporter"
+    OCI_CONFIG_DIR = f"/var/lib/{OCI_NAME}"
+    OCI_CONFIG_PATH = f"{OCI_CONFIG_DIR}/config.yaml"
 
     def __init__(self, *args: Any) -> None:
         """Initialize charm."""
         super().__init__(*args)
-        self.exporter = ExporterSnap()
+        self.name = "pje"
+        self.container = self.unit.get_container(self.name)
+        self.exporter = ExporterOCI()
         self.prometheus_target = PrometheusScrapeTarget(self, "prometheus-scrape")
-        self._snap_path: Optional[str] = None
-        self._snap_path_set = False
+        self.current_config_hash = None
 
+        self.framework.observe(self.on.pje_pebble_ready, self._on_pje_pebble_ready)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
-        self.framework.observe(self.on.install, self._on_install)
-        self.framework.observe(self.on.stop, self._on_stop)
         self.framework.observe(self.on.upgrade_charm, self._on_upgrade_charm)
-        self.framework.observe(self.on.update_status, self._on_update_status)
         self.framework.observe(
             self.prometheus_target.on.prometheus_available, self._on_prometheus_available
         )
@@ -121,27 +99,6 @@ class PrometheusJujuExporterCharm(CharmBase):
             self, relation_name="grafana-k8s-dashboard"
         )
         self.grafana_dashboard_provider._reinitialize_dashboard_data(inject_dropdowns=False)
-
-    @property
-    def snap_path(self) -> Optional[str]:
-        """Get local path to exporter snap.
-
-        If this charm has snap file for the exporter attached as a resource, this property returns
-        path to the snap file. If the resource was not attached of the file is empty, this property
-        returns None.
-        """
-        if not self._snap_path_set:
-            try:
-                self._snap_path = str(self.model.resources.fetch("exporter-snap"))
-                # Don't return path to empty resource file
-                if not os.path.getsize(self._snap_path) > 0:
-                    self._snap_path = None
-            except ModelError:
-                self._snap_path = None
-            finally:
-                self._snap_path_set = True
-
-        return self._snap_path
 
     def get_controller_ca_cert(self) -> str:
         """Get CA certificate used by targeted Juju controller.
@@ -221,58 +178,110 @@ class PrometheusJujuExporterCharm(CharmBase):
 
         logger.debug("Setting port %s as opened.", new_port)
         hookenv.open_port(new_port)
+    
+    def _on_pje_pebble_ready(self, event):
+        self._configure()
 
-    def _on_install(self, _: Optional[InstallEvent]) -> None:
-        """Install prometheus-juju-exporter snap."""
-        self.unit.status = MaintenanceStatus("Installing charm software.")
-        try:
-            self.exporter.install(self.snap_path)
-        except snap.CouldNotAcquireLockException as exc:
-            install_source = "local resource" if self.snap_path else "snap store"
-            logger.error("Failed to install %s from %s.", self.exporter.SNAP_NAME, install_source)
-            raise exc
-
-    @evaluate_status
     def _on_upgrade_charm(self, _: UpgradeCharmEvent) -> None:
         """Process charm upgrade event.
 
         Since this event is triggered also when new resource is attached to the charm,
         we must re-install the snap and re-apply configuration
         """
-        self._on_install(None)
         self._on_config_changed(None)
 
-    def _on_stop(self, _: StopEvent) -> None:
-        """Clean up exporter snap on charm's removal."""
-        self.exporter.uninstall()
-
-    @evaluate_status
     def _on_config_changed(self, _: Optional[ConfigChangedEvent]) -> None:
         """Handle changed configuration."""
-        logger.info("Processing new charm configuration.")
-        exporter_config = self.generate_exporter_config()
-        try:
-            self.exporter.apply_config(exporter_config)
-        except ExporterConfigError as exc:
-            # Replace snap config names with their charm equivalents
-            err_msg = str(exc)
-            for charm_option, snap_option in self.SNAP_CONFIG_MAP.items():
-                err_msg = err_msg.replace(snap_option, charm_option)
-
-            logger.error(err_msg)
-            self.unit.status = BlockedStatus("Invalid configuration. Please see logs.")
+        self._configure()
+        
+    
+    def _configure(self):
+        if not self.container.can_connect():
             return
+        logger.info("Processing new charm configuration.")
+        self.unit.status = MaintenanceStatus("Processing new charm configuration.")
+        restart = False
+
+        exporter_config = self.generate_exporter_config()
+        exporter_config_hash = hashlib.sha256(str(exporter_config).encode("utf-8")).hexdigest()
+        logger.info("exporter_config_hash: %s", exporter_config_hash)
+        logger.info("current_config_hash: %s", self.current_config_hash)
+
+        if exporter_config_hash != self.current_config_hash:
+            logger.info("inside hash compare")
+            try:
+                config_data = self.exporter.apply_config(exporter_config)
+                logger.info("config_data: %s", config_data)
+                self.container.push(self.OCI_CONFIG_PATH, config_data, make_dirs=True)
+                logger.info("push: %s", self.OCI_CONFIG_PATH)
+                self.current_config_hash = exporter_config_hash
+            except ExporterConfigError as exc:
+                # Replace snap config names with their charm equivalents
+                err_msg = str(exc)
+                for charm_option, oci_option in self.OCI_CONFIG_MAP.items():
+                    err_msg = err_msg.replace(oci_option, charm_option)
+
+                logger.error(err_msg)
+                self.unit.status = BlockedStatus("Invalid configuration. Please see logs.")
+                return
+            except ConnectionError:
+                logger.error(
+                    "Could not push datasource config. Pebble refused connection. Shutting down?"
+                )
+            restart = True
+        
+        if self.container.get_plan().services != self._build_layer().services:
+            restart = True
 
         self.reconfigure_scrape_target()
         self.reconfigure_open_ports()
 
+        logger.info("restart: %s", restart)
+        if restart:
+            self.restart_pje()
+        else:
+            # All clear, move to active.
+            # We can basically only get here if the charm is completely restarted, but all of
+            # the configs are correct, with the correct pebble plan, such as a node reboot.
+            #
+            # A node reboot does not send any identifiable events (`start`, `pebble_ready`), so
+            # this is more or less the 'fallthrough' part of a case statement
+            if not isinstance(self.unit.status, ActiveStatus):
+                self.unit.status = ActiveStatus()
+    
+    def restart_pje(self):
+        layer = self._build_layer()
+        try:
+            self.container.add_layer(self.name, layer, combine=True)
+            logging.info("Added updated layer '%s' to Pebble plan", self.name)
+            self.container.restart(self.name)
+            logging.info("Restarted %s service", self.name)
+            self.unit.status = ActiveStatus()
+        except Exception as e:
+            # debug because, on initial container startup when Grafana has an open lock and is
+            # populating, this comes up with ERRCODE: 26
+            logger.error("Could not restart prometheus-juju-exporter and build new layer: {}".format(e))
+
+    def _build_layer(self) -> Layer:
+        return Layer(
+            {
+                "summary": "prometheus-juju-exporter layer",
+                "description": "prometheus-juju-exporter layer",
+                "services": {
+                    self.name: {
+                        "override": "replace",
+                        "summary": "prometheus-juju-exporter service",
+                        "command": "/bin/python3 -m prometheus_juju_exporter.cli",
+                        "startup": "enabled",
+                    }
+                },
+            }
+        )
+    
+
     def _on_prometheus_available(self, _: PrometheusConnected) -> None:
         """Trigger configuration of a prometheus scrape target."""
         self.reconfigure_scrape_target()
-
-    @evaluate_status
-    def _on_update_status(self, _: UpdateStatusEvent) -> None:
-        """Assess unit's status."""
 
 
 if __name__ == "__main__":  # pragma: nocover
